@@ -1,7 +1,7 @@
 // Client side: connects to the daemon and requests host command execution.
 
 use std::io::{IoSlice, IoSliceMut};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -14,32 +14,39 @@ use nix::sys::socket::{
 use crate::protocol::{MAX_MSG, Request, Response};
 
 pub fn cmd_run(sock_path: &Path, cmd: &[String]) -> anyhow::Result<ExitCode> {
-    if !sock_path.exists() {
-        bail!("socket not found: {}", sock_path.display());
-    }
-
     let cwd = std::env::current_dir().context("cannot determine current directory")?;
-
-    let req = Request {
+    let req = Request::Run {
         cmd: cmd.to_vec(),
         cwd,
     };
 
-    let conn = socket::socket(
-        AddressFamily::Unix,
-        SockType::SeqPacket,
-        SockFlag::SOCK_CLOEXEC,
-        None,
-    )
-    .context("cannot create socket")?;
-
-    let addr =
-        UnixAddr::new(sock_path.as_os_str().as_encoded_bytes()).context("invalid socket path")?;
-    socket::connect(conn.as_raw_fd(), &addr).context("cannot connect to hostexec daemon")?;
-
+    let conn = connect_to_daemon(sock_path)?;
     send_request(conn.as_raw_fd(), &req)?;
     let code = recv_response_loop(conn.as_raw_fd())?;
     Ok(ExitCode::from(code))
+}
+
+pub fn cmd_notify(sock_path: &Path) -> anyhow::Result<ExitCode> {
+    let req = Request::Notify;
+
+    let conn = connect_to_daemon(sock_path)?;
+    let payload = serde_json::to_vec(&req).context("cannot serialize notify request")?;
+    let iov = [IoSlice::new(&payload)];
+    socket::sendmsg::<UnixAddr>(conn.as_raw_fd(), &iov, &[], MsgFlags::empty(), None)
+        .context("cannot send notify request")?;
+
+    let resp = recv_response(conn.as_raw_fd())?;
+    match resp {
+        Response::Exit { code } => Ok(ExitCode::from(u8::try_from(code).unwrap_or(1))),
+        Response::Error { message } => {
+            eprintln!("hostexec: {message}");
+            Ok(ExitCode::FAILURE)
+        }
+        Response::Denied => {
+            eprintln!("hostexec: request denied");
+            Ok(ExitCode::FAILURE)
+        }
+    }
 }
 
 fn send_request(fd: RawFd, req: &Request) -> anyhow::Result<()> {
@@ -71,6 +78,26 @@ fn recv_response_loop(fd: RawFd) -> anyhow::Result<u8> {
             }
         }
     }
+}
+
+fn connect_to_daemon(sock_path: &Path) -> anyhow::Result<OwnedFd> {
+    if !sock_path.exists() {
+        bail!("socket not found: {}", sock_path.display());
+    }
+
+    let conn = socket::socket(
+        AddressFamily::Unix,
+        SockType::SeqPacket,
+        SockFlag::SOCK_CLOEXEC,
+        None,
+    )
+    .context("cannot create socket")?;
+
+    let addr =
+        UnixAddr::new(sock_path.as_os_str().as_encoded_bytes()).context("invalid socket path")?;
+    socket::connect(conn.as_raw_fd(), &addr).context("cannot connect to hostexec daemon")?;
+
+    Ok(conn)
 }
 
 fn recv_response(fd: RawFd) -> anyhow::Result<Response> {

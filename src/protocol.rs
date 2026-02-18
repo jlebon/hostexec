@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 pub const MAX_MSG: usize = 64 * 1024;
 
 #[derive(Serialize, Deserialize)]
-pub struct Request {
-    pub cmd: Vec<String>,
-    pub cwd: PathBuf,
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum Request {
+    Run { cmd: Vec<String>, cwd: PathBuf },
+    Notify,
 }
 
 #[derive(Serialize, Deserialize)]

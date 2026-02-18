@@ -33,7 +33,7 @@ cargo install --path .
 Within tmux, in one terminal, run:
 
 ```bash
-SOCK_FILE=$(mktemp)
+SOCK_FILE=$(mktemp); echo $SOCK_FILE
 hostexec serve --write-socket-path-to "$SOCK_FILE"
 ```
 
@@ -43,10 +43,24 @@ In another terminal, run:
 HOSTEXEC_SOCKET=$(cat "$SOCK_FILE") hostexec run echo hello world
 ```
 
+### Notifications
+
+The `notify` subcommand sends a terminal bell to the host, which shows up as
+an alert in the tmux status bar. Unlike `run`, it does not require user
+approval.
+
+```bash
+HOSTEXEC_SOCKET=$(cat "$SOCK_FILE") hostexec notify
+```
+
+See the [idle notification hook](#idle-notification-hook) section for how to
+wire this into your agent automatically.
+
 ### Integrating into your AI agent sandbox
 
 You'd normally not manually run hostexec serve/run at all. Instead, you'd
 integrate it into your agent sandboxing solution as follows:
+
 1. Before starting a new sandbox, the harness runs `hostexec serve` e.g. as a
    background process or via systemd-run.
 2. When creating the sandbox, pass in the socket path via the `HOSTEXEC_SOCKET`
@@ -63,7 +77,7 @@ integrate it into your agent sandboxing solution as follows:
 This also implies the `hostexec` binary is available in the sandbox. You could
 mount it in or have it pre-installed in the container image.
 
-### Example usage for GitHub
+#### Example usage for GitHub
 
 My AI agent has access to a read-only GitHub token. My host has access to a
 read-write GitHub token. So I also have this line in my `AGENTS.md`:
@@ -76,6 +90,30 @@ And that way, the agent can still do write-level things when needed.
 If you're building an automated or CI workflow around GitHub, you probably want
 to set up a dedicated GitHub user instead (or use service-gator; see below).
 
+#### Idle notification hook
+
+Most coding agents support hooks or plugins that fire when the agent finishes
+thinking and is waiting for input. You can use `hostexec notify` in these hooks
+to get alerted on the host.
+
+For example, with [OpenCode](https://opencode.ai/docs/plugins):
+
+```js
+// ~/.config/opencode/plugins/notify.js
+export const NotifyPlugin = async ({ $ }) => {
+  return {
+    event: async ({ event }) => {
+      if (event.type === "session.idle") {
+        await $`hostexec notify`;
+      }
+    },
+  };
+};
+```
+
+Similar hook mechanisms exist in other agents (e.g. Claude Code hooks, Cursor
+rules).
+
 ## Comparison with related projects
 
 ### vs host-spawn / flatpak-spawn
@@ -85,6 +123,7 @@ which it reimplements) lets a containerized process run commands on the host by
 calling a D-Bus method served by the Flatpak session helper daemon on the host.
 
 The main differences are:
+
 1. There is no approval mechanism because host-spawn is not meant as a security
    boundary.
 2. host-spawn uses D-Bus. hostexec uses a `SOCK_SEQPACKET` socket directly
@@ -99,6 +138,7 @@ on the host. Instead, it exposes a fixed set of tools via the MCP protocol over
 HTTP.
 
 The main differences are:
+
 1. hostexec allows an AI agent to run any host commands. service-gator exposes
    a limited set of service-specific operations (e.g. creating PRs, pushing
    branches).

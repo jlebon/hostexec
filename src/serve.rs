@@ -9,7 +9,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{ExitCode, Stdio};
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use nix::libc;
 use nix::sys::socket::{
     self, AddressFamily, Backlog, ControlMessageOwned, MsgFlags, SockFlag, SockType, UnixAddr,
@@ -17,7 +17,7 @@ use nix::sys::socket::{
 use nix::sys::termios;
 use tracing::{error, info};
 
-use crate::protocol::{Request, Response, MAX_MSG};
+use crate::protocol::{MAX_MSG, Request, Response};
 
 /// Prompt subcommand exit codes.
 const PROMPT_ALLOW: u8 = 0;
@@ -82,53 +82,19 @@ fn handle_connection(
 ) -> anyhow::Result<()> {
     let (req, mut client_fds) = recv_request(conn_fd)?;
 
-    // Ensure client fds are always closed, even on early return.
-    let result = handle_request(conn_fd, &req, allowlist, approve_all, &mut client_fds);
+    let result = match req {
+        Request::Run { cmd, cwd } => {
+            if client_fds.len() != 3 {
+                bail!("expected 3 fds for run request, got {}", client_fds.len());
+            }
+            handle_run(conn_fd, &cmd, &cwd, allowlist, approve_all, &mut client_fds)
+        }
+        Request::Notify => handle_notify(conn_fd),
+    };
 
+    // Ensure client fds are always closed, even on early return.
     close_fds(&mut client_fds);
     result
-}
-
-fn handle_request(
-    conn_fd: RawFd,
-    req: &Request,
-    allowlist: &mut HashSet<Vec<String>>,
-    approve_all: bool,
-    client_fds: &mut Vec<OwnedFd>,
-) -> anyhow::Result<()> {
-    if req.cmd.is_empty() {
-        send_response(
-            conn_fd,
-            &Response::Error {
-                message: "empty command".into(),
-            },
-        )?;
-        return Ok(());
-    }
-
-    let cmd_str = format_cmd(&req.cmd);
-    info!(cmd = cmd_str, cwd = %req.cwd.display(), "request");
-
-    // Check allowlist (match on exact command + args).
-    if !approve_all && !allowlist.contains(&req.cmd) {
-        match prompt_user(&cmd_str, &req.cwd)? {
-            PromptResult::Always => {
-                allowlist.insert(req.cmd.clone());
-                info!(cmd = cmd_str, "always allowed");
-            }
-            PromptResult::Allow => {
-                info!(cmd = cmd_str, "allowed");
-            }
-            PromptResult::Deny => {
-                info!(cmd = cmd_str, "denied");
-                send_response(conn_fd, &Response::Denied)?;
-                return Ok(());
-            }
-        }
-    }
-
-    run_command(conn_fd, req, client_fds);
-    Ok(())
 }
 
 fn recv_request(conn_fd: RawFd) -> anyhow::Result<(Request, Vec<OwnedFd>)> {
@@ -159,12 +125,51 @@ fn recv_request(conn_fd: RawFd) -> anyhow::Result<(Request, Vec<OwnedFd>)> {
         bail!("empty message from client");
     }
 
-    if fds.len() != 3 {
-        bail!("expected 3 fds, got {}", fds.len());
-    }
-
     let req: Request = serde_json::from_slice(&buf[..nbytes]).context("invalid request JSON")?;
     Ok((req, fds))
+}
+
+fn handle_run(
+    conn_fd: RawFd,
+    cmd: &[String],
+    cwd: &Path,
+    allowlist: &mut HashSet<Vec<String>>,
+    approve_all: bool,
+    client_fds: &mut Vec<OwnedFd>,
+) -> anyhow::Result<()> {
+    if cmd.is_empty() {
+        send_response(
+            conn_fd,
+            &Response::Error {
+                message: "empty command".into(),
+            },
+        )?;
+        return Ok(());
+    }
+
+    let cmd_str = format_cmd(cmd);
+    info!(cmd = cmd_str, cwd = %cwd.display(), "request");
+
+    // Check allowlist (match on exact command + args).
+    if !approve_all && !allowlist.contains(cmd) {
+        match prompt_user(&cmd_str, cwd)? {
+            PromptResult::Always => {
+                allowlist.insert(cmd.to_vec());
+                info!(cmd = cmd_str, "always allowed");
+            }
+            PromptResult::Allow => {
+                info!(cmd = cmd_str, "allowed");
+            }
+            PromptResult::Deny => {
+                info!(cmd = cmd_str, "denied");
+                send_response(conn_fd, &Response::Denied)?;
+                return Ok(());
+            }
+        }
+    }
+
+    run_command(conn_fd, cmd, cwd, client_fds);
+    Ok(())
 }
 
 enum PromptResult {
@@ -204,15 +209,16 @@ fn prompt_user(cmd_str: &str, cwd: &Path) -> anyhow::Result<PromptResult> {
     }
 }
 
-fn run_command(conn_fd: RawFd, req: &Request, client_fds: &mut Vec<OwnedFd>) {
+fn run_command(conn_fd: RawFd, cmd: &[String], cwd: &Path, client_fds: &mut Vec<OwnedFd>) {
     // Consume ownership of the fds so the child process inherits them.
     let stdin_fd = client_fds.remove(0);
     let stdout_fd = client_fds.remove(0);
     let stderr_fd = client_fds.remove(0);
 
-    let mut cmd = std::process::Command::new(&req.cmd[0]);
-    cmd.args(&req.cmd[1..])
-        .current_dir(&req.cwd)
+    let mut command = std::process::Command::new(&cmd[0]);
+    command
+        .args(&cmd[1..])
+        .current_dir(cwd)
         .stdin(Stdio::from(stdin_fd))
         .stdout(Stdio::from(stdout_fd))
         .stderr(Stdio::from(stderr_fd));
@@ -220,7 +226,7 @@ fn run_command(conn_fd: RawFd, req: &Request, client_fds: &mut Vec<OwnedFd>) {
     // SAFETY: prctl(PR_SET_PDEATHSIG) is async-signal-safe and the only
     // operation in this pre_exec hook.
     unsafe {
-        cmd.pre_exec(|| {
+        command.pre_exec(|| {
             let ret = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
             if ret != 0 {
                 return Err(std::io::Error::last_os_error());
@@ -229,7 +235,7 @@ fn run_command(conn_fd: RawFd, req: &Request, client_fds: &mut Vec<OwnedFd>) {
         });
     }
 
-    let child = cmd.spawn();
+    let child = command.spawn();
 
     let mut child = match child {
         Ok(c) => c,
@@ -238,7 +244,7 @@ fn run_command(conn_fd: RawFd, req: &Request, client_fds: &mut Vec<OwnedFd>) {
                 let _ = send_response(
                     conn_fd,
                     &Response::Error {
-                        message: format!("command not found: {}", req.cmd[0]),
+                        message: format!("command not found: {}", cmd[0]),
                     },
                 );
                 127
@@ -272,6 +278,16 @@ fn run_command(conn_fd: RawFd, req: &Request, client_fds: &mut Vec<OwnedFd>) {
     };
 
     let _ = send_response(conn_fd, &Response::Exit { code });
+}
+
+fn handle_notify(conn_fd: RawFd) -> anyhow::Result<()> {
+    info!("notify");
+    std::io::stdout()
+        .write_all(b"\x07")
+        .context("cannot write bell to stdout")?;
+    std::io::stdout().flush().context("cannot flush stdout")?;
+    send_response(conn_fd, &Response::Exit { code: 0 })?;
+    Ok(())
 }
 
 pub fn cmd_prompt() -> anyhow::Result<ExitCode> {
