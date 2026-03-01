@@ -13,8 +13,10 @@ use anyhow::{Context, bail};
 use nix::libc;
 use nix::sys::socket::{
     self, AddressFamily, Backlog, ControlMessageOwned, MsgFlags, SockFlag, SockType, UnixAddr,
+    UnixCredentials, sockopt::PeerCredentials,
 };
 use nix::sys::termios;
+use nix::unistd::{Uid, User};
 use tracing::{error, info};
 
 use crate::protocol::{MAX_MSG, Request, Response};
@@ -59,7 +61,12 @@ pub fn cmd_serve(write_socket_path_to: Option<&Path>, approve_all: bool) -> anyh
             Err(e) => return Err(e).context("accept"),
         };
 
-        if let Err(e) = handle_connection(conn_fd.as_raw_fd(), &mut allowlist, approve_all) {
+        let peer_cred =
+            socket::getsockopt(&conn_fd, PeerCredentials).context("cannot get peer credentials")?;
+
+        if let Err(e) =
+            handle_connection(conn_fd.as_raw_fd(), peer_cred, &mut allowlist, approve_all)
+        {
             error!("error handling connection: {e:#}");
         }
         // conn_fd dropped here, closing the connection
@@ -77,6 +84,7 @@ fn create_socket_dir() -> anyhow::Result<tempfile::TempDir> {
 /// Handle a single client connection.
 fn handle_connection(
     conn_fd: RawFd,
+    peer_cred: UnixCredentials,
     allowlist: &mut HashSet<Vec<String>>,
     approve_all: bool,
 ) -> anyhow::Result<()> {
@@ -87,7 +95,15 @@ fn handle_connection(
             if client_fds.len() != 3 {
                 bail!("expected 3 fds for run request, got {}", client_fds.len());
             }
-            handle_run(conn_fd, &cmd, &cwd, allowlist, approve_all, &mut client_fds)
+            handle_run(
+                conn_fd,
+                &cmd,
+                &cwd,
+                &peer_cred,
+                allowlist,
+                approve_all,
+                &mut client_fds,
+            )
         }
         Request::Notify => handle_notify(conn_fd),
     };
@@ -133,6 +149,7 @@ fn handle_run(
     conn_fd: RawFd,
     cmd: &[String],
     cwd: &Path,
+    peer_cred: &UnixCredentials,
     allowlist: &mut HashSet<Vec<String>>,
     approve_all: bool,
     client_fds: &mut Vec<OwnedFd>,
@@ -148,11 +165,11 @@ fn handle_run(
     }
 
     let cmd_str = format_cmd(cmd);
-    info!(cmd = cmd_str, cwd = %cwd.display(), "request");
+    info!(cmd = cmd_str, cwd = %cwd.display(), pid = peer_cred.pid(), uid = peer_cred.uid(), "request");
 
     // Check allowlist (match on exact command + args).
     if !approve_all && !allowlist.contains(cmd) {
-        match prompt_user(&cmd_str, cwd)? {
+        match prompt_user(&cmd_str, cwd, peer_cred)? {
             PromptResult::Always => {
                 allowlist.insert(cmd.to_vec());
                 info!(cmd = cmd_str, "always allowed");
@@ -178,12 +195,18 @@ enum PromptResult {
     Deny,
 }
 
-fn prompt_user(cmd_str: &str, cwd: &Path) -> anyhow::Result<PromptResult> {
+fn prompt_user(
+    cmd_str: &str,
+    cwd: &Path,
+    peer_cred: &UnixCredentials,
+) -> anyhow::Result<PromptResult> {
     // Pass data via environment variables (tmux -e) so that no user-controlled
     // content appears in the shell command that tmux passes to sh -c.
     let exe = std::fs::read_link("/proc/self/exe").context("cannot read /proc/self/exe")?;
     let prompt_cmd = shlex::try_join([exe.to_string_lossy().as_ref(), "prompt"].iter().copied())
         .context("failed to quote prompt command")?;
+
+    let exec_uid = nix::unistd::geteuid();
 
     let status = std::process::Command::new("tmux")
         .args([
@@ -196,6 +219,12 @@ fn prompt_user(cmd_str: &str, cwd: &Path) -> anyhow::Result<PromptResult> {
             &format!("XOC_PROMPT_CMD={cmd_str}"),
             "-e",
             &format!("XOC_PROMPT_CWD={}", cwd.display()),
+            "-e",
+            &format!("XOC_PROMPT_PID={}", peer_cred.pid()),
+            "-e",
+            &format!("XOC_PROMPT_PEER_UID={}", peer_cred.uid()),
+            "-e",
+            &format!("XOC_PROMPT_EXEC_UID={exec_uid}"),
             "-E",
             &prompt_cmd,
         ])
@@ -293,13 +322,25 @@ fn handle_notify(conn_fd: RawFd) -> anyhow::Result<()> {
 pub fn cmd_prompt() -> anyhow::Result<ExitCode> {
     let cmd_str = std::env::var("XOC_PROMPT_CMD").context("XOC_PROMPT_CMD not set")?;
     let cwd = std::env::var("XOC_PROMPT_CWD").context("XOC_PROMPT_CWD not set")?;
+    let pid = std::env::var("XOC_PROMPT_PID").context("XOC_PROMPT_PID not set")?;
+    let peer_uid: u32 = std::env::var("XOC_PROMPT_PEER_UID")
+        .context("XOC_PROMPT_PEER_UID not set")?
+        .parse()
+        .context("invalid XOC_PROMPT_PEER_UID")?;
+    let exec_uid: u32 = std::env::var("XOC_PROMPT_EXEC_UID")
+        .context("XOC_PROMPT_EXEC_UID not set")?
+        .parse()
+        .context("invalid XOC_PROMPT_EXEC_UID")?;
 
     println!();
     println!("  Host command execution request");
     println!("  ─────────────────────────────────");
     println!();
-    println!("  cwd: {cwd}");
-    println!("  cmd: {cmd_str}");
+    println!("     cmd: {cmd_str}");
+    println!("     cwd: {cwd}");
+    println!("     pid: {pid}");
+    println!("  caller: {}", format_uid(peer_uid));
+    println!("  run as: {}", format_uid(exec_uid));
     println!();
     println!("  [Y] Allow once  [A] Always allow  [N] Deny");
     println!();
@@ -310,6 +351,13 @@ pub fn cmd_prompt() -> anyhow::Result<ExitCode> {
         b'y' | b'Y' | b'\r' | b'\n' => Ok(ExitCode::from(PROMPT_ALLOW)),
         b'a' | b'A' => Ok(ExitCode::from(PROMPT_ALWAYS)),
         _ => Ok(ExitCode::from(PROMPT_DENY)),
+    }
+}
+
+fn format_uid(uid: u32) -> String {
+    match User::from_uid(Uid::from_raw(uid)) {
+        Ok(Some(user)) => format!("{uid} ({name})", name = user.name),
+        _ => uid.to_string(),
     }
 }
 
