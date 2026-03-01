@@ -33,11 +33,13 @@ enum Command {
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
     },
-    /// Send a terminal bell to the host (shows as alert in tmux).
+    /// Fire a named hook on the host.
     Notify {
         /// Path to the daemon socket.
         #[arg(long, env = "HOSTEXEC_SOCKET")]
         socket: PathBuf,
+        /// Hook name (e.g. "idle", "busy").
+        hook: String,
     },
     /// Start the host execution daemon.
     Serve {
@@ -72,7 +74,7 @@ fn main() -> ExitCode {
 
     let result: anyhow::Result<ExitCode> = match cli.command {
         Command::Run { socket, cmd } => client::cmd_run(&socket, &cmd),
-        Command::Notify { socket } => client::cmd_notify(&socket),
+        Command::Notify { socket, hook } => client::cmd_notify(&socket, &hook),
         Command::Serve {
             write_socket_path_to,
             dangerously_approve_all,

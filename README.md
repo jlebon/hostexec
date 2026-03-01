@@ -20,6 +20,9 @@ commands. On the host side, the server listens for requests and interactively
 asks permission to run the command (through a tmux prompt). A good sandboxed
 environment covers 98% of AI agent usage. hostexec is for the other 2%.
 
+More recently, hostexec also adds some additional tmux integration sugar (see
+"Notifications" section).
+
 ## Installing
 
 ```
@@ -45,16 +48,30 @@ HOSTEXEC_SOCKET=$(cat "$SOCK_FILE") hostexec run echo hello world
 
 ### Notifications
 
-The `notify` subcommand sends a terminal bell to the host, which shows up as
-an alert in the tmux status bar. Unlike `run`, it does not require user
-approval.
+Apart from the primary goal of host command execution, hostexec also exposes a
+`notify` subcommand which can be used by sandboxed agents to notify the host of
+their current state through integration with tmux. Unlike `run`, `notify` does
+not require user approval. Actions on the host side for each hook event are
+hardcoded and detailed in the table below. The daemon uses `$TMUX_PANE` from its
+environment to determine the pane it's in.
 
 ```bash
-HOSTEXEC_SOCKET=$(cat "$SOCK_FILE") hostexec notify
+HOSTEXEC_SOCKET=$(cat "$SOCK_FILE") hostexec notify idle
 ```
 
-See the [idle notification hook](#idle-notification-hook) section for how to
-wire this into your agent automatically.
+Supported hooks:
+
+| Hook | Effect |
+|---|---|
+| `session-start` | Add 🤖 prefix to window name |
+| `busy` | Set window suffix to ⏳ |
+| `idle` | Terminal bell + set window suffix to ✋ |
+| `session-exit` | Restore original window name |
+
+Unknown hook names are silently ignored.
+
+See the [notification hooks](#notification-hooks) section for how to wire
+this into your agent automatically.
 
 ### Integrating into your AI agent sandbox
 
@@ -90,21 +107,45 @@ And that way, the agent can still do write-level things when needed.
 If you're building an automated or CI workflow around GitHub, you probably want
 to set up a dedicated GitHub user instead (or use service-gator; see below).
 
-#### Idle notification hook
+#### Notification hooks
 
-Most coding agents support hooks or plugins that fire when the agent finishes
-thinking and is waiting for input. You can use `hostexec notify` in these hooks
-to get alerted on the host.
+Most coding agents support hooks or plugins that fire on lifecycle events. You
+can use `hostexec notify <hook>` in these to update tmux window indicators and
+get bell alerts on the host.
 
 For example, with [OpenCode](https://opencode.ai/docs/plugins):
 
 ```js
 // ~/.config/opencode/plugins/notify.js
-export const NotifyPlugin = async ({ $ }) => {
+export const NotifyPlugin = async ({ client, $ }) => {
+  await $`hostexec notify session-start`;
+
+  const isTopLevel = async (sessionID) => {
+    const res = await client.session.get({ path: { id: sessionID } });
+    return !res.data?.parentID;
+  };
+
   return {
+    "tool.execute.before": async (input, _output) => {
+      if (input.tool !== "question" && input.tool !== "plan_exit") return;
+      await $`hostexec notify idle`;
+    },
+    "tool.execute.after": async (input, _output) => {
+      if (input.tool !== "question") return;
+      await $`hostexec notify busy`;
+    },
     event: async ({ event }) => {
-      if (event.type === "session.idle") {
-        await $`hostexec notify`;
+      if (event.type === "global.disposed") {
+        await $`hostexec notify session-exit`;
+        return;
+      }
+      if (event.type !== "session.status") return;
+      const { sessionID, status } = event.properties;
+      if (!(await isTopLevel(sessionID))) return;
+      if (status.type === "busy") {
+        await $`hostexec notify busy`;
+      } else if (status.type === "idle") {
+        await $`hostexec notify idle`;
       }
     },
   };

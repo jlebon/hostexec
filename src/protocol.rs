@@ -11,7 +11,7 @@ pub const MAX_MSG: usize = 64 * 1024;
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Request {
     Run { cmd: Vec<String>, cwd: PathBuf },
-    Notify,
+    Notify { hook: String },
 }
 
 #[derive(Serialize, Deserialize)]

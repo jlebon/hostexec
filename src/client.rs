@@ -26,8 +26,10 @@ pub fn cmd_run(sock_path: &Path, cmd: &[String]) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::from(code))
 }
 
-pub fn cmd_notify(sock_path: &Path) -> anyhow::Result<ExitCode> {
-    let req = Request::Notify;
+pub fn cmd_notify(sock_path: &Path, hook: &str) -> anyhow::Result<ExitCode> {
+    let req = Request::Notify {
+        hook: hook.to_string(),
+    };
 
     let conn = connect_to_daemon(sock_path)?;
     let payload = serde_json::to_vec(&req).context("cannot serialize notify request")?;
