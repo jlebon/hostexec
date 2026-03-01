@@ -220,7 +220,7 @@ fn prompt_user(
             "-w",
             "80%",
             "-h",
-            "12",
+            "50%",
             "-e",
             &format!("XOC_PROMPT_CMD={cmd_str}"),
             "-e",
@@ -398,25 +398,61 @@ pub fn cmd_prompt() -> anyhow::Result<ExitCode> {
         .parse()
         .context("invalid XOC_PROMPT_EXEC_UID")?;
 
-    println!();
-    println!("  Host command execution request");
-    println!("  ─────────────────────────────────");
-    println!();
-    println!("     cmd: {cmd_str}");
-    println!("     cwd: {cwd}");
-    println!("     pid: {pid}");
-    println!("  caller: {}", format_uid(peer_uid));
-    println!("  run as: {}", format_uid(exec_uid));
-    println!();
-    println!("  [Y] Allow once  [A] Always allow  [N] Deny");
-    println!();
-    std::io::stdout().flush()?;
+    let caller = format_uid(peer_uid);
+    let run_as = format_uid(exec_uid);
 
-    let key = read_keypress();
-    match key {
-        b'y' | b'Y' | b'\r' | b'\n' => Ok(ExitCode::from(PROMPT_ALLOW)),
-        b'a' | b'A' => Ok(ExitCode::from(PROMPT_ALWAYS)),
-        _ => Ok(ExitCode::from(PROMPT_DENY)),
+    let display = format!(
+        "\n\
+         \x20 Host command execution request\n\
+         \x20 ─────────────────────────────────\n\
+         \n\
+         \x20    cmd: {cmd_str}\n\
+         \x20    cwd: {cwd}\n\
+         \x20    pid: {pid}\n\
+         \x20 caller: {caller}\n\
+         \x20 run as: {run_as}\n"
+    );
+
+    // Use `less` for scrollable display. It handles wrapping and scrolling
+    // correctly regardless of terminal dimensions. The -F flag makes it exit
+    // immediately if the content fits on one screen, -R passes through ANSI
+    // codes, and -X keeps content visible after exit.
+    loop {
+        show_with_pager(&display);
+
+        println!();
+        println!("  [Y] Allow once  [A] Always allow  [N] Deny  [R] Review");
+        println!();
+        std::io::stdout().flush()?;
+
+        match read_keypress() {
+            b'r' | b'R' => continue,
+            b'y' | b'Y' | b'\r' | b'\n' => return Ok(ExitCode::from(PROMPT_ALLOW)),
+            b'a' | b'A' => return Ok(ExitCode::from(PROMPT_ALWAYS)),
+            _ => return Ok(ExitCode::from(PROMPT_DENY)),
+        }
+    }
+}
+
+fn show_with_pager(text: &str) {
+    let child = std::process::Command::new("less")
+        .args(["-FRX"])
+        .stdin(Stdio::piped())
+        .spawn();
+
+    match child {
+        Ok(mut child) => {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+                // Drop stdin to signal EOF to less.
+            }
+            let _ = child.wait();
+        }
+        Err(_) => {
+            // less not available; print directly.
+            let _ = std::io::stdout().write_all(text.as_bytes());
+            let _ = std::io::stdout().flush();
+        }
     }
 }
 
