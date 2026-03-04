@@ -52,7 +52,7 @@ pub fn cmd_serve(write_socket_path_to: Option<&Path>, approve_all: bool) -> anyh
     info!(path = %sock_path.display(), "listening");
 
     let mut allowlist: HashSet<Vec<String>> = HashSet::new();
-    let mut window_base_name: Option<String> = None;
+    let mut session_active = false;
 
     loop {
         let conn_fd = match socket::accept(sock.as_raw_fd()) {
@@ -70,7 +70,7 @@ pub fn cmd_serve(write_socket_path_to: Option<&Path>, approve_all: bool) -> anyh
             peer_cred,
             &mut allowlist,
             approve_all,
-            &mut window_base_name,
+            &mut session_active,
         ) {
             error!("error handling connection: {e:#}");
         }
@@ -92,7 +92,7 @@ fn handle_connection(
     peer_cred: UnixCredentials,
     allowlist: &mut HashSet<Vec<String>>,
     approve_all: bool,
-    window_base_name: &mut Option<String>,
+    session_active: &mut bool,
 ) -> anyhow::Result<()> {
     let (req, mut client_fds) = recv_request(conn_fd)?;
 
@@ -111,7 +111,7 @@ fn handle_connection(
                 &mut client_fds,
             )
         }
-        Request::Notify { hook } => handle_notify(conn_fd, &hook, window_base_name),
+        Request::Notify { hook } => handle_notify(conn_fd, &hook, session_active),
     };
 
     // Ensure client fds are always closed, even on early return.
@@ -315,26 +315,30 @@ fn run_command(conn_fd: RawFd, cmd: &[String], cwd: &Path, client_fds: &mut Vec<
     let _ = send_response(conn_fd, &Response::Exit { code });
 }
 
-fn handle_notify(
-    conn_fd: RawFd,
-    hook: &str,
-    window_base_name: &mut Option<String>,
-) -> anyhow::Result<()> {
+fn handle_notify(conn_fd: RawFd, hook: &str, session_active: &mut bool) -> anyhow::Result<()> {
     info!(hook, "notify");
     match hook {
         "session-start" => {
-            snapshot_tmux_window_name(window_base_name);
-            set_tmux_window_name(window_base_name, None);
+            *session_active = true;
+            set_tmux_window_name(None);
         }
-        "busy" => set_tmux_window_name(window_base_name, Some("⏳")),
+        "busy" => {
+            if *session_active {
+                set_tmux_window_name(Some("⏳"));
+            }
+        }
         "idle" => {
             let _ = std::io::stdout().write_all(b"\x07");
             let _ = std::io::stdout().flush();
-            set_tmux_window_name(window_base_name, Some("✋"));
+            if *session_active {
+                set_tmux_window_name(Some("✋"));
+            }
         }
         "session-exit" => {
-            tmux_rename_window(window_base_name.as_deref());
-            *window_base_name = None;
+            if *session_active {
+                restore_tmux_window_name();
+                *session_active = false;
+            }
         }
         _ => info!(hook, "unknown hook, ignoring"),
     }
@@ -342,39 +346,59 @@ fn handle_notify(
     Ok(())
 }
 
-/// Capture the current tmux window name as the base name for later changes.
-fn snapshot_tmux_window_name(base: &mut Option<String>) {
-    let pane = match std::env::var("TMUX_PANE") {
-        Ok(p) => p,
-        Err(_) => return,
+/// Query the current tmux window name, strip our decorations (🤖 prefix and
+/// known suffixes), and set it to `🤖 <base> [suffix]`.
+fn set_tmux_window_name(suffix: Option<&str>) {
+    let Some(base) = query_tmux_window_base_name() else {
+        return;
     };
-    let output = std::process::Command::new("tmux")
-        .args(["display-message", "-t", &pane, "-p", "#{window_name}"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
-    if let Ok(o) = output
-        && o.status.success()
-    {
-        *base = Some(String::from_utf8_lossy(&o.stdout).trim().to_string());
-    }
-}
-
-/// Set the tmux window name to `🤖 <base> [suffix]`.
-/// No-op if no base name has been captured (i.e. no prior `session-start`).
-fn set_tmux_window_name(base: &Option<String>, suffix: Option<&str>) {
-    let Some(base) = base else { return };
     let name = match suffix {
         Some(s) => format!("🤖 {base} {s}"),
         None => format!("🤖 {base}"),
     };
-    tmux_rename_window(Some(&name));
+    tmux_rename_window(&name);
+}
+
+/// Strip our decorations from the current tmux window name and restore it.
+fn restore_tmux_window_name() {
+    let Some(base) = query_tmux_window_base_name() else {
+        return;
+    };
+    tmux_rename_window(&base);
+}
+
+/// Query the current tmux window name and strip our known decorations to
+/// recover the user's base name.
+fn query_tmux_window_base_name() -> Option<String> {
+    let pane = std::env::var("TMUX_PANE").ok()?;
+    let output = std::process::Command::new("tmux")
+        .args(["display-message", "-t", &pane, "-p", "#{window_name}"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // Strip our "🤖 " prefix if present.
+    if let Some(rest) = name.strip_prefix("🤖 ") {
+        name = rest.to_string();
+    }
+    // Strip known status suffixes.
+    for suffix in [" ⏳", " ✋"] {
+        if let Some(rest) = name.strip_suffix(suffix) {
+            name = rest.to_string();
+            break;
+        }
+    }
+    Some(name)
 }
 
 /// Rename the tmux window containing this daemon's pane.
-/// No-op if `$TMUX_PANE` is unset or `name` is None.
-fn tmux_rename_window(name: Option<&str>) {
-    let (Some(name), Ok(pane)) = (name, std::env::var("TMUX_PANE")) else {
+/// No-op if `$TMUX_PANE` is unset.
+fn tmux_rename_window(name: &str) {
+    let Ok(pane) = std::env::var("TMUX_PANE") else {
         return;
     };
     let _ = std::process::Command::new("tmux")
