@@ -64,8 +64,8 @@ Supported hooks:
 | Hook | Effect |
 |---|---|
 | `session-start` | Add 🤖 prefix to window name |
-| `busy` | Set window suffix to ⏳ |
-| `idle` | Terminal bell + set window suffix to ✋ |
+| `busy` | Set window status to ⏳ |
+| `idle` | Terminal bell + set window status to ✋ |
 | `session-exit` | Restore original window name |
 
 Unknown hook names are silently ignored.

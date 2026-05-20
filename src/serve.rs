@@ -346,14 +346,14 @@ fn handle_notify(conn_fd: RawFd, hook: &str, session_active: &mut bool) -> anyho
     Ok(())
 }
 
-/// Query the current tmux window name, strip our decorations (🤖 prefix and
-/// known suffixes), and set it to `🤖 <base> [suffix]`.
-fn set_tmux_window_name(suffix: Option<&str>) {
+/// Query the current tmux window name, strip our decorations, and set it to
+/// `🤖<status> <base>` (or `🤖<base>` if no status indicator).
+fn set_tmux_window_name(status: Option<&str>) {
     let Some(base) = query_tmux_window_base_name() else {
         return;
     };
-    let name = match suffix {
-        Some(s) => format!("🤖 {base} {s}"),
+    let name = match status {
+        Some(s) => format!("🤖{s} {base}"),
         None => format!("🤖 {base}"),
     };
     tmux_rename_window(&name);
@@ -381,13 +381,9 @@ fn query_tmux_window_base_name() -> Option<String> {
         return None;
     }
     let mut name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    // Strip our "🤖 " prefix if present.
-    if let Some(rest) = name.strip_prefix("🤖 ") {
-        name = rest.to_string();
-    }
-    // Strip known status suffixes.
-    for suffix in [" ⏳", " ✋"] {
-        if let Some(rest) = name.strip_suffix(suffix) {
+    // Strip our "🤖" prefix with optional status indicator.
+    for prefix in ["🤖⏳ ", "🤖✋ ", "🤖 "] {
+        if let Some(rest) = name.strip_prefix(prefix) {
             name = rest.to_string();
             break;
         }
