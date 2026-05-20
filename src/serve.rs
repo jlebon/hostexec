@@ -19,6 +19,7 @@ use nix::sys::termios;
 use nix::unistd::{Uid, User};
 use tracing::{error, info};
 
+use crate::allowlist::Allowlist;
 use crate::protocol::{Request, Response, MAX_MSG};
 
 /// Prompt subcommand exit codes.
@@ -51,7 +52,8 @@ pub fn cmd_serve(write_socket_path_to: Option<&Path>, approve_all: bool) -> anyh
 
     info!(path = %sock_path.display(), "listening");
 
-    let mut allowlist: HashSet<Vec<String>> = HashSet::new();
+    let file_allowlist = Allowlist::load();
+    let mut session_allowlist: HashSet<Vec<String>> = HashSet::new();
     let mut session_active = false;
 
     loop {
@@ -68,7 +70,8 @@ pub fn cmd_serve(write_socket_path_to: Option<&Path>, approve_all: bool) -> anyh
         if let Err(e) = handle_connection(
             conn_fd.as_raw_fd(),
             peer_cred,
-            &mut allowlist,
+            &file_allowlist,
+            &mut session_allowlist,
             approve_all,
             &mut session_active,
         ) {
@@ -90,7 +93,8 @@ fn create_socket_dir() -> anyhow::Result<tempfile::TempDir> {
 fn handle_connection(
     conn_fd: RawFd,
     peer_cred: UnixCredentials,
-    allowlist: &mut HashSet<Vec<String>>,
+    file_allowlist: &Allowlist,
+    session_allowlist: &mut HashSet<Vec<String>>,
     approve_all: bool,
     session_active: &mut bool,
 ) -> anyhow::Result<()> {
@@ -106,7 +110,8 @@ fn handle_connection(
                 &cmd,
                 &cwd,
                 &peer_cred,
-                allowlist,
+                file_allowlist,
+                session_allowlist,
                 approve_all,
                 &mut client_fds,
             )
@@ -151,12 +156,14 @@ fn recv_request(conn_fd: RawFd) -> anyhow::Result<(Request, Vec<OwnedFd>)> {
     Ok((req, fds))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_run(
     conn_fd: RawFd,
     cmd: &[String],
     cwd: &Path,
     peer_cred: &UnixCredentials,
-    allowlist: &mut HashSet<Vec<String>>,
+    file_allowlist: &Allowlist,
+    session_allowlist: &mut HashSet<Vec<String>>,
     approve_all: bool,
     client_fds: &mut Vec<OwnedFd>,
 ) -> anyhow::Result<()> {
@@ -173,11 +180,10 @@ fn handle_run(
     let cmd_str = format_cmd(cmd);
     info!(cmd = cmd_str, cwd = %cwd.display(), pid = peer_cred.pid(), uid = peer_cred.uid(), "request");
 
-    // Check allowlist (match on exact command + args).
-    if !approve_all && !allowlist.contains(cmd) {
+    if !approve_all && !file_allowlist.matches(cmd) && !session_allowlist.contains(cmd) {
         match prompt_user(&cmd_str, cwd, peer_cred)? {
             PromptResult::Always => {
-                allowlist.insert(cmd.to_vec());
+                session_allowlist.insert(cmd.to_vec());
                 info!(cmd = cmd_str, "always allowed");
             }
             PromptResult::Allow => {

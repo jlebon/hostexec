@@ -1,5 +1,6 @@
 // Entrypoint
 
+mod allowlist;
 mod client;
 mod protocol;
 mod serve;

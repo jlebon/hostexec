@@ -73,6 +73,36 @@ Unknown hook names are silently ignored.
 See the [notification hooks](#notification-hooks) section for how to wire
 this into your agent automatically.
 
+### Allowlist
+
+You can configure commands that are always allowed without prompting by
+creating an allowlist file at `$XDG_CONFIG_HOME/hostexec/allowlist.toml`
+(typically `~/.config/hostexec/allowlist.toml`).
+
+Each entry specifies a command and a match type:
+
+- `type = "exact"` — only matches the exact argv
+- `type = "prefix"` — matches the argv and any additional trailing arguments
+
+```toml
+# Allow "rhjira show <anything>" without prompting.
+[[allow]]
+cmd = ["rhjira", "show"]
+type = "prefix"
+
+# Allow exactly "git status" and nothing else.
+[[allow]]
+cmd = ["git", "status"]
+type = "exact"
+```
+
+The allowlist is loaded once at daemon startup. If the file is missing, no
+commands are auto-approved. If it exists but cannot be parsed, a warning is
+logged and all commands go through the normal approval flow.
+
+This is separate from the per-session "Always allow" option in the interactive
+prompt, which only lasts for the lifetime of the daemon.
+
 ### Integrating into your AI agent sandbox
 
 You'd normally not manually run hostexec serve/run at all. Instead, you'd
