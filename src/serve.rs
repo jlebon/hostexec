@@ -9,17 +9,17 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{ExitCode, Stdio};
 
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use nix::libc;
 use nix::sys::socket::{
-    self, AddressFamily, Backlog, ControlMessageOwned, MsgFlags, SockFlag, SockType, UnixAddr,
-    UnixCredentials, sockopt::PeerCredentials,
+    self, sockopt::PeerCredentials, AddressFamily, Backlog, ControlMessageOwned, MsgFlags,
+    SockFlag, SockType, UnixAddr, UnixCredentials,
 };
 use nix::sys::termios;
 use nix::unistd::{Uid, User};
 use tracing::{error, info};
 
-use crate::protocol::{MAX_MSG, Request, Response};
+use crate::protocol::{Request, Response, MAX_MSG};
 
 /// Prompt subcommand exit codes.
 const PROMPT_ALLOW: u8 = 0;
