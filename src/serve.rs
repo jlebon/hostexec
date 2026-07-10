@@ -27,6 +27,8 @@ const PROMPT_ALLOW: u8 = 0;
 const PROMPT_DENY: u8 = 1;
 const PROMPT_ALWAYS: u8 = 2;
 
+const PROMPT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub fn cmd_serve(write_socket_path_to: Option<&Path>, approve_all: bool) -> anyhow::Result<()> {
     let sock_dir = create_socket_dir()?;
     let sock_path = sock_dir.path().join("socket");
@@ -443,19 +445,31 @@ pub fn cmd_prompt() -> anyhow::Result<ExitCode> {
     // correctly regardless of terminal dimensions. The -F flag makes it exit
     // immediately if the content fits on one screen, -R passes through ANSI
     // codes, and -X keeps content visible after exit.
+    let mut cooldown = true;
     loop {
         show_with_pager(&display);
 
         println!();
+        if cooldown {
+            print!("  \x1b[2m(input blocked)\x1b[0m");
+            std::io::stdout().flush()?;
+            std::thread::sleep(PROMPT_COOLDOWN);
+            let _ = termios::tcflush(std::io::stdin(), termios::FlushArg::TCIFLUSH);
+            print!("\r\x1b[2K");
+            cooldown = false;
+        }
         println!("  [Y] Allow once  [A] Always allow  [N] Deny  [R] Review");
         println!();
         std::io::stdout().flush()?;
 
-        match read_keypress() {
-            b'r' | b'R' => continue,
-            b'y' | b'Y' | b'\r' | b'\n' => return Ok(ExitCode::from(PROMPT_ALLOW)),
-            b'a' | b'A' => return Ok(ExitCode::from(PROMPT_ALWAYS)),
-            _ => return Ok(ExitCode::from(PROMPT_DENY)),
+        loop {
+            match read_keypress() {
+                b'R' => break,
+                b'Y' => return Ok(ExitCode::from(PROMPT_ALLOW)),
+                b'A' => return Ok(ExitCode::from(PROMPT_ALWAYS)),
+                b'N' => return Ok(ExitCode::from(PROMPT_DENY)),
+                _ => {}
+            }
         }
     }
 }
